@@ -1,0 +1,210 @@
+/**
+ * ActionLedger - pure hash-chain primitives for the tamper-evident agent action ledger.
+ *
+ * Every value movement an agent initiates on-chain is recorded as one append-only row.
+ * Each row's `entryHash = sha256(canonicalFields ‖ prevHash)`, so the chain head commits the
+ * entire history (Merkle-equivalent): editing or deleting any historical row changes its
+ * `entryHash` and breaks every link from that point forward. `verifyChain()` walks a user's
+ * ordered rows and reports the exact index at which the chain first breaks.
+ *
+ * This module is intentionally I/O-free - no DB, no chain, no clock. It contains only the
+ * deterministic hashing and verification logic (the part that lifts near-verbatim from the
+ * three.ws `economy-ledger.js` hash construction). Storage is supplied by the host: the
+ * API layer injects `computeEntryHash` into its locked append so this package never depends on
+ * the database layer.
+ *
+ * Credits: hash-chain construction ported from the three.ws economy master ledger.
+ */
+import { createHash } from 'node:crypto';
+const sha256 = (input) => createHash('sha256').update(input).digest('hex');
+// ─── Constants ─────────────────────────────────────────────────────────────
+/** Genesis link - the `prevHash` of the first entry in a user's chain (seq 1). */
+export const LEDGER_GENESIS_HASH = '0'.repeat(64);
+/** Field separator used in canonicalisation - a NUL byte, which cannot appear in the values. */
+const FIELD_SEP = '\u0000';
+/**
+ * The canonicalisation field separator, re-exported for audit tooling.
+ *
+ * Load-bearing and frozen - it is folded into every hash ever written, so changing it would
+ * invalidate every existing chain. Exported so an audit bundle can state the exact construction a
+ * third party needs in order to re-derive the hashes offline, without that consumer having to
+ * hard-code a control character it cannot see.
+ */
+export const LEDGER_FIELD_SEPARATOR = FIELD_SEP;
+/**
+ * The canonical field order folded into `entryHash`, in hash order. Purely descriptive - the
+ * authority is `canonicalizeEntry`, and `ActionLedger.test.ts` pins the two together so this
+ * cannot silently drift.
+ */
+export const LEDGER_CANONICAL_FIELD_ORDER = [
+    'seq',
+    'ts',
+    'userId',
+    'agentId',
+    'event',
+    'target',
+    'amountWei',
+    'valueUsd',
+    'txHash',
+    'reason',
+    'balanceBeforeWei',
+    'balanceAfterWei',
+    'network',
+    'detail',
+];
+// ─── Canonicalisation & hashing ──────────────────────────────────────────────
+/**
+ * Deterministically serialise an object with keys sorted recursively, so semantically-equal
+ * `detail` payloads always hash identically regardless of key insertion order.
+ */
+const stableStringify = (value) => {
+    if (value === null || typeof value !== 'object')
+        return JSON.stringify(value) ?? 'null';
+    if (Array.isArray(value))
+        return `[${value.map((v) => stableStringify(v)).join(',')}]`;
+    const keys = Object.keys(value).sort();
+    const body = keys
+        .map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`)
+        .join(',');
+    return `{${body}}`;
+};
+const str = (v) => v ?? '';
+const num = (v) => v === null || v === undefined ? '' : String(v);
+/**
+ * Produce the canonical string that gets hashed. Field order is fixed and load-bearing - never
+ * reorder it, or previously-written entries will fail verification.
+ */
+export const canonicalizeEntry = (entry) => [
+    String(entry.seq),
+    str(entry.ts),
+    str(entry.userId),
+    str(entry.agentId),
+    str(entry.event),
+    str(entry.target),
+    str(entry.amountWei),
+    num(entry.valueUsd),
+    str(entry.txHash),
+    str(entry.reason),
+    str(entry.balanceBeforeWei),
+    str(entry.balanceAfterWei),
+    str(entry.network),
+    stableStringify(entry.detail ?? null),
+].join(FIELD_SEP);
+/**
+ * Compute a row's `entryHash` from its canonical fields and the previous row's hash.
+ * `entryHash = sha256(canonical(entry) ‖ SEP ‖ prevHash)`.
+ */
+export const computeEntryHash = (entry, prevHash) => sha256(canonicalizeEntry(entry) + FIELD_SEP + prevHash);
+// ─── Verification ────────────────────────────────────────────────────────────
+const intact = (length) => ({
+    brokenAtIndex: -1,
+    brokenAtSeq: null,
+    length,
+    reason: null,
+    valid: true,
+});
+const broken = (index, seq, reason, length) => ({
+    brokenAtIndex: index,
+    brokenAtSeq: seq,
+    length,
+    reason,
+    valid: false,
+});
+/**
+ * Verify a *window* of a user's chain. Identical to {@link verifyChain} except that the starting
+ * link is caller-supplied, so a page fetched from `seq > 1` can be checked without pretending it
+ * begins at genesis.
+ *
+ * A window anchored to anything other than the genesis hash proves the rows it holds were not
+ * altered relative to each other and relative to that anchor; it proves nothing about entries
+ * before the anchor. Callers must surface that distinction rather than presenting a window as a
+ * whole-chain proof.
+ */
+export const verifyChainWindow = (rows, options = {}) => {
+    const { anchorHash = LEDGER_GENESIS_HASH } = options;
+    const ordered = [...rows].sort((a, b) => a.seq - b.seq);
+    const n = ordered.length;
+    if (n === 0)
+        return intact(0);
+    let prevHash = anchorHash;
+    for (let i = 0; i < n; i++) {
+        const row = ordered[i];
+        // Link check: this row must point at the prior row's hash (genesis for the first row).
+        if (row.prevHash !== prevHash) {
+            return broken(i, row.seq, `prevHash mismatch at seq ${row.seq}: expected ${prevHash.slice(0, 12)}…, stored ${String(row.prevHash).slice(0, 12)}…`, n);
+        }
+        // Integrity check: recompute the entry's own hash from its committed fields.
+        const recomputed = computeEntryHash(row, row.prevHash);
+        if (recomputed !== row.entryHash) {
+            return broken(i, row.seq, `entryHash mismatch at seq ${row.seq}: row was altered after it was written`, n);
+        }
+        prevHash = row.entryHash;
+    }
+    return intact(n);
+};
+/**
+ * Verify a user's ledger chain. `rows` must already be scoped to a single user; they are sorted
+ * by `seq` before walking. Returns the exact index/seq of the first break, so a reconcile job can
+ * pinpoint tampering. An empty chain is vacuously valid.
+ *
+ * Detects: a missing genesis link, a broken `prevHash` link between consecutive rows, and any row
+ * whose stored `entryHash` does not match a recomputation of its own committed fields.
+ */
+export const verifyChain = (rows) => verifyChainWindow(rows, { anchorHash: LEDGER_GENESIS_HASH });
+/**
+ * Audit every row independently and report a per-row verdict, rather than stopping at the first
+ * break like {@link verifyChain} does. This is what a UI needs in order to mark exactly which
+ * entries are intact and which are not - a single break index cannot express that a later row is
+ * *also* self-consistent even though its link is orphaned.
+ *
+ * The walk always continues using each row's own `entryHash` as the next expected link, so one
+ * altered row invalidates its own `hashOk` and the following row's `linkOk` without cascading a
+ * false failure through the entire remainder of the chain.
+ */
+export const auditChainRows = (rows, options = {}) => {
+    const { anchorHash = LEDGER_GENESIS_HASH } = options;
+    const ordered = [...rows].sort((a, b) => a.seq - b.seq);
+    if (ordered.length === 0)
+        return [];
+    let expectedPrevHash = anchorHash;
+    return ordered.map((row) => {
+        const computedHash = computeEntryHash(row, row.prevHash);
+        const check = {
+            computedHash,
+            expectedPrevHash,
+            hashOk: computedHash === row.entryHash,
+            linkOk: row.prevHash === expectedPrevHash,
+            seq: row.seq,
+            storedHash: row.entryHash,
+        };
+        expectedPrevHash = row.entryHash;
+        return check;
+    });
+};
+/**
+ * Find on-chain outbound transactions that were never recorded in the ledger - the
+ * key-compromise / breach signal. Pure set difference: any observed outbound tx hash absent from
+ * the ledger's recorded tx hashes is unrecorded. Comparison is case-insensitive (tx hashes are
+ * hex and casing varies across RPC providers).
+ *
+ * @param onChainOutbound tx hashes observed on-chain as outbound from the agent's wallet(s)
+ * @param ledgerRows      the user's recorded ledger rows
+ */
+export const findUnrecordedOutbound = (onChainOutbound, ledgerRows) => {
+    const recorded = new Set(ledgerRows
+        .map((r) => r.txHash)
+        .filter((h) => !!h)
+        .map((h) => h.toLowerCase()));
+    const seen = new Set();
+    const unrecorded = [];
+    for (const hash of onChainOutbound) {
+        if (!hash)
+            continue;
+        const key = hash.toLowerCase();
+        if (recorded.has(key) || seen.has(key))
+            continue;
+        seen.add(key);
+        unrecorded.push(hash);
+    }
+    return unrecorded;
+};
